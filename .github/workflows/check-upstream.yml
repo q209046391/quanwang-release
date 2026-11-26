@@ -2,6 +2,9 @@ name: Check upstream release
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/check-upstream.yml']
 
 permissions:
   contents: read
@@ -11,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Read the latest upstream release
+      - name: Verify the latest upstream Windows source archive
         shell: bash
         run: |
           set -euo pipefail
@@ -19,6 +22,15 @@ jobs:
             https://api.github.com/repos/jackotom/hongguo-drama/releases/latest)"
           tag="$(jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+(\\.[0-9]+)?$"))' <<<"$release")"
           jq -e '.draft == false and .prerelease == false' <<<"$release" >/dev/null
-          jq -er '.assets[] | select(.name | endswith("-windows-source.zip")) | .name' <<<"$release"
-          printf 'Verified upstream release metadata for %s\n' "$tag"
-
+          name="hongguo-downloader-${tag#v}-windows-source.zip"
+          asset="$(jq -cer --arg name "$name" '.assets[] | select(.name == $name and .state == "uploaded")' <<<"$release")"
+          id="$(jq -er '.id | select(type == "number")' <<<"$asset")"
+          sha="$(jq -er '.digest | select(test("^sha256:[a-f0-9]{64}$")) | sub("^sha256:"; "")' <<<"$asset")"
+          archive="$RUNNER_TEMP/upstream-windows.zip"
+          curl --fail --silent --show-error --location --max-time 90 --max-filesize 52428800 \
+            --header 'Accept: application/octet-stream' \
+            "https://api.github.com/repos/jackotom/hongguo-drama/releases/assets/$id?download=1" \
+            --output "$archive"
+          printf '%s  %s\n' "$sha" "$archive" | sha256sum --check --status
+          python3 -m zipfile --test "$archive"
+          printf 'Verified %s, SHA-256 %s\n' "$name" "$sha"
