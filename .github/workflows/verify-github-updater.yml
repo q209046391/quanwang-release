@@ -1,0 +1,96 @@
+name: Verify GitHub installer upgrade
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-github-updater.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      TEST_TAG: updater-test-${{ github.run_id }}-${{ github.run_attempt }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build isolated NSIS installer pair
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $fixture = Join-Path $env:RUNNER_TEMP 'quanwang-updater'
+          New-Item -ItemType Directory -Path $fixture | Out-Null
+          Copy-Item scripts/verify-github-updater.cjs (Join-Path $fixture 'main.cjs')
+          Set-Location $fixture
+          $feed = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TEST_TAG/"
+          $package = @{
+            name = 'quanwang-updater-fixture'
+            version = '8.4.5'
+            main = 'main.cjs'
+            dependencies = @{ 'electron-updater' = '6.8.9' }
+            devDependencies = @{ electron = '44.11.5'; 'electron-builder' = '26.15.3' }
+            build = @{
+              appId = 'io.quanwang.updater-fixture'
+              files = @('main.cjs', 'package.json')
+              win = @{ target = @('nsis') }
+              nsis = @{ oneClick = $true; runAfterFinish = $false }
+              publish = @{ provider = 'generic'; url = $feed }
+              artifactName = 'quanwang-updater-fixture-${version}.exe'
+            }
+          }
+          $package | ConvertTo-Json -Depth 8 | Set-Content package.json -Encoding utf8NoBOM
+          npm install --no-audit --no-fund
+          npx --no-install electron-builder --win nsis --x64 --publish never -c.directories.output=old
+          npm pkg set version=8.4.6
+          npx --no-install electron-builder --win nsis --x64 --publish never -c.directories.output=new
+          $artifact = Get-Item -LiteralPath 'new/quanwang-updater-fixture-8.4.6.exe'
+          $sha = [Convert]::ToBase64String([Security.Cryptography.SHA512]::HashData([IO.File]::ReadAllBytes($artifact.FullName)))
+          if ((Get-Content -Raw 'new/latest.yml') -notmatch ('(?m)^sha512: '+[regex]::Escape($sha)+'\s*$')) {
+            throw 'Installer does not match the updater manifest'
+          }
+      - name: Publish the installer fixture as a prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $folder = Join-Path $env:RUNNER_TEMP 'quanwang-updater/new'
+          gh release create $env:TEST_TAG (Join-Path $folder 'quanwang-updater-fixture-8.4.6.exe') (Join-Path $folder 'latest.yml') --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --latest=false --title "Windows updater test $env:GITHUB_RUN_ID" --notes "Automated test fixture for the GitHub installer upgrade path."
+      - name: Download and install the update from GitHub
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fixture = Join-Path $env:RUNNER_TEMP 'quanwang-updater'
+          $installed = Join-Path $fixture 'installed'
+          $old = Join-Path $fixture 'old/quanwang-updater-fixture-8.4.5.exe'
+          $setup = Start-Process -FilePath $old -ArgumentList ('/S /currentuser /D='+$installed) -PassThru -Wait -WindowStyle Hidden
+          if ($setup.ExitCode -ne 0) { throw "Install failed ($($setup.ExitCode))" }
+          $feed = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TEST_TAG/"
+          $application = Join-Path $installed 'quanwang-updater-fixture.exe'
+          Start-Process -FilePath $application -ArgumentList "--feed=$feed" -WindowStyle Hidden
+          $profile = Join-Path $env:APPDATA 'quanwang-updater-fixture'
+          $marker = Join-Path $profile 'upgrade-result.json'
+          $failure = Join-Path $profile 'upgrade-error.txt'
+          for ($attempt = 0; $attempt -lt 90; $attempt++) {
+            if (Test-Path -LiteralPath $failure) { throw (Get-Content -Raw -LiteralPath $failure) }
+            if (Test-Path -LiteralPath $marker) {
+              $result = Get-Content -Raw -LiteralPath $marker | ConvertFrom-Json
+              if ($result.version -eq '8.4.6' -and $result.savedValue -eq 'keep-me') {
+                $version = (Get-Item -LiteralPath $application).VersionInfo.ProductVersion
+                if ($version -notmatch '^8\.4\.6(?:\.0)?$') { throw "Unexpected executable version $version" }
+                'PASS: GitHub download, installation, automatic restart, and test profile preservation'
+                exit 0
+              }
+            }
+            Start-Sleep -Seconds 2
+          }
+          throw 'Updated application did not restart'
+
