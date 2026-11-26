@@ -1,7 +1,124 @@
-ResourceUnavailable: 
-Line |
-   3 |  python -c "import yaml; from pathlib import Path; p=Path('release-aut …
-     |  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     | Program 'python.exe' failed to run: An error occurred trying to start process 'C:\Users\EDY\AppData\Local\Microsoft\WindowsApps\python.exe' with working directory 'D:\ai项目\修改2'. 系统无法访问此文件。At line:3 char:1
-+ python -c "import yaml; from pathlib import Path; p=Path('release-aut …
-+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~.
+name: Verify full Quanwang installer restart
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-quanwang-restart.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install the verified 8.4.5 test client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $installer = Join-Path $env:RUNNER_TEMP 'quanwang-8.4.5-restart-test.exe'
+          $installed = Join-Path $env:RUNNER_TEMP 'quanwang-app'
+          $asset = 'https://github.com/q209046391/quanwang-release/releases/download/quanwang-app-test-8.4.6/quanwang-8.4.5-restart-test.exe'
+          curl.exe --fail --location --silent --show-error --retry 3 --max-time 180 $asset --output $installer
+          if ((Get-FileHash -LiteralPath $installer).Hash -ne 'A5838EEFBA66C91DB8276D580E0FE8A3C4336728462B6E4E8E714A327557693C') {
+            throw 'The 8.4.5 test installer checksum differs'
+          }
+          $setup = Start-Process -FilePath $installer -ArgumentList ('/S /currentuser /D=' + $installed) -PassThru -Wait -WindowStyle Hidden
+          if ($setup.ExitCode -ne 0) { throw "8.4.5 installation failed ($($setup.ExitCode))" }
+          $application = Join-Path $installed '全网短剧.exe'
+          if ((Get-Item -LiteralPath $application).VersionInfo.ProductVersion -notmatch '^8\.4\.5(?:\.0)?$') {
+            throw 'Expected installed version 8.4.5'
+          }
+          "QUANWANG_APP=$application" >> $env:GITHUB_ENV
+      - name: Request the update and observe the automatic restart
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $original = Start-Process -FilePath $env:QUANWANG_APP -ArgumentList '--remote-debugging-address=127.0.0.1','--remote-debugging-port=18785','--quanwang-test-update' -PassThru
+          @'
+          import assert from 'node:assert/strict';
+          import { setTimeout as delay } from 'node:timers/promises';
+
+          let target;
+          for (let attempt = 0; attempt < 60 && !target; attempt++) {
+            try {
+              const response = await fetch('http://127.0.0.1:18785/json/list', { signal: AbortSignal.timeout(1000) });
+              target = (await response.json()).find(page => page.type === 'page' && page.url.includes('dist-react'));
+            } catch {}
+            if (!target) await delay(500);
+          }
+          assert.ok(target, 'The installed client did not load its renderer');
+          const socket = new WebSocket(target.webSocketDebuggerUrl);
+          const deadline = setTimeout(() => {
+            console.error('The installed renderer did not respond');
+            process.exit(1);
+          }, 20000);
+          try {
+            await new Promise((resolve, reject) => {
+              socket.addEventListener('open', resolve, { once: true });
+              socket.addEventListener('error', reject, { once: true });
+            });
+            const expression = `(async () => {
+              const button = (...labels) => [...document.querySelectorAll('button')]
+                .find(item => labels.includes(item.textContent.trim()) && !item.disabled);
+              const waitFor = async (...labels) => {
+                for (let i = 0; i < 60; i++) {
+                  const item = button(...labels);
+                  if (item) return item;
+                  await new Promise(resolve => setTimeout(resolve, 100));
+                }
+                throw new Error('Missing button: ' + labels.join(' / '));
+              };
+              const settings = await waitFor('设置', 'Settings');
+              const info = await window.electronAPI.getAppInfo();
+              if (info.version !== '8.4.5') throw new Error('The running client is not 8.4.5');
+              settings.click();
+              (await waitFor('检查更新', 'Check for updates')).click();
+              return true;
+            })()`;
+            const result = await new Promise((resolve, reject) => {
+              socket.addEventListener('message', event => {
+                const message = JSON.parse(event.data);
+                if (message.id !== 1) return;
+                if (message.error || message.result?.exceptionDetails) {
+                  reject(new Error(message.result?.exceptionDetails?.exception?.description || 'Renderer evaluation failed'));
+                } else {
+                  resolve(message.result.result.value);
+                }
+              });
+              socket.addEventListener('close', () => reject(new Error('Renderer disconnected')), { once: true });
+              socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, awaitPromise: true, returnByValue: true } }));
+            });
+            assert.equal(result, true);
+            console.log('Requested the GitHub update from the 8.4.5 Settings page');
+          } finally {
+            clearTimeout(deadline);
+            socket.close();
+          }
+          '@ | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'trigger-quanwang-update.mjs') -Encoding utf8NoBOM
+          node (Join-Path $env:RUNNER_TEMP 'trigger-quanwang-update.mjs')
+          $archive = Join-Path (Split-Path -Parent $env:QUANWANG_APP) 'resources/app.asar'
+          $limit = [DateTime]::UtcNow.AddMinutes(5)
+          do {
+            $name = [IO.Path]::GetFileName($env:QUANWANG_APP)
+            $restarted = Get-CimInstance Win32_Process -Filter "Name='$name'" | Where-Object {
+              $_.ProcessId -ne $original.Id -and $_.ExecutablePath -eq $env:QUANWANG_APP -and
+                $_.CommandLine -match '(?:^|\s)--updated(?:\s|$)'
+            } | Select-Object -First 1
+            if ($restarted -and $original.HasExited) {
+              $version = (Get-Item -LiteralPath $env:QUANWANG_APP).VersionInfo.ProductVersion
+              if ($version -notmatch '^8\.4\.6(?:\.0)?$') { throw "Unexpected version after restart: $version" }
+              if ((Get-FileHash -LiteralPath $archive).Hash -ne '98085E9D68C3CC57B09BE98F388162EACDB3E09A5B3C1C1F1BA5D23E5B644C09') {
+                throw 'The installed 8.4.6 payload differs'
+              }
+              'PASS: the GitHub installer replaced 8.4.5 and automatically launched the verified 8.4.6 client'
+              exit 0
+            }
+            Start-Sleep -Seconds 2
+          } while ([DateTime]::UtcNow -lt $limit)
+          throw "No automatic restart within five minutes (original exited: $($original.HasExited))"
+
