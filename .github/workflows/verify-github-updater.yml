@@ -49,9 +49,9 @@ jobs:
           }
           $package | ConvertTo-Json -Depth 8 | Set-Content package.json -Encoding utf8NoBOM
           npm install --no-audit --no-fund
-          npx --no-install electron-builder --win nsis --x64 --publish never -c.directories.output=old
+          node node_modules/electron-builder/out/cli/cli.js --win nsis --x64 --publish never '-c.directories.output=old'
           npm pkg set version=8.4.6
-          npx --no-install electron-builder --win nsis --x64 --publish never -c.directories.output=new
+          node node_modules/electron-builder/out/cli/cli.js --win nsis --x64 --publish never '-c.directories.output=new'
           $artifact = Get-Item -LiteralPath 'new/quanwang-updater-fixture-8.4.6.exe'
           $sha = [Convert]::ToBase64String([Security.Cryptography.SHA512]::HashData([IO.File]::ReadAllBytes($artifact.FullName)))
           if ((Get-Content -Raw 'new/latest.yml') -notmatch ('(?m)^sha512: '+[regex]::Escape($sha)+'\s*$')) {
