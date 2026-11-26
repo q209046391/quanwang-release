@@ -1,0 +1,7 @@
+ResourceUnavailable: 
+Line |
+   3 |  python -c "import yaml; from pathlib import Path; p=Path('release-aut …
+     |  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | Program 'python.exe' failed to run: An error occurred trying to start process 'C:\Users\EDY\AppData\Local\Microsoft\WindowsApps\python.exe' with working directory 'D:\ai项目\修改2'. 系统无法访问此文件。At line:3 char:1
++ python -c "import yaml; from pathlib import Path; p=Path('release-aut …
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~.
