@@ -1,0 +1,24 @@
+name: Check upstream release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read the latest upstream release
+        shell: bash
+        run: |
+          set -euo pipefail
+          release="$(curl --fail --silent --show-error --max-time 30 \
+            https://api.github.com/repos/jackotom/hongguo-drama/releases/latest)"
+          tag="$(jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+(\\.[0-9]+)?$"))' <<<"$release")"
+          jq -e '.draft == false and .prerelease == false' <<<"$release" >/dev/null
+          jq -er '.assets[] | select(.name | endswith("-windows-source.zip")) | .name' <<<"$release"
+          printf 'Verified upstream release metadata for %s\n' "$tag"
+
