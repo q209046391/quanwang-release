@@ -141,7 +141,8 @@ async function currentManifest(prefix, yaml, objectExists) {
 }
 
 async function publish(mode, manifest, manifestPath, installerPath, exeAsset, yaml) {
-  const prefix = mode === 'stable' ? 'windows/x64/' : 'automation-test/';
+  const prefix = mode === 'stable' ? 'windows/x64/'
+    : mode === 'candidate' ? 'automation-test/candidate/' : 'automation-test/';
   const COS = require('cos-nodejs-sdk-v5');
   const { SecretId, SecretKey, SecurityToken } = await getTemporaryCredentials(await getIdentityToken());
   function signedHeaders(method, name, headers = {}, Query = {}) {
@@ -271,7 +272,7 @@ async function publish(mode, manifest, manifestPath, installerPath, exeAsset, ya
   const assetUrl = origin + prefix + manifest.path;
   // Never replace an existing versioned EXE with different bytes.
   if (!await objectExists(manifest.path)) {
-    await downloadInstaller(exeAsset, installerPath, manifest);
+    if (exeAsset) await downloadInstaller(exeAsset, installerPath, manifest);
     console.log('Uploading the checked installer to ' + prefix);
     await uploadInstaller(manifest.path);
   }
@@ -292,8 +293,38 @@ async function publish(mode, manifest, manifestPath, installerPath, exeAsset, ya
 
 async function main() {
   const mode = process.env.COS_PUBLISH_MODE;
-  assert.ok(['validate', 'test', 'stable'].includes(mode));
+  assert.ok(['validate', 'test', 'stable', 'candidate', 'build-input'].includes(mode));
+  if (mode === 'build-input') {
+    const [, , destination] = process.argv;
+    assert.ok(destination);
+    const Key = 'build-inputs/quanwang-8.4.6-overlay.zip';
+    const url = new URL(Key, origin);
+    const COS = require('cos-nodejs-sdk-v5');
+    const { SecretId, SecretKey, SecurityToken } = await getTemporaryCredentials(await getIdentityToken());
+    const Headers = { host: url.host, 'x-cos-security-token': SecurityToken };
+    const authorization = COS.getAuthorization({ SecretId, SecretKey, Method: 'GET', Key, Headers, Expires: 120 });
+    const payload = await request(url, { headers: { ...Headers, authorization }, redirect: 'error' });
+    assert.ok(payload.ok && payload.body, 'Private build input cannot be read, HTTP ' + payload.status);
+    const length = Number(payload.headers.get('content-length'));
+    assert.ok(length > 0 && length < 20_000_000, 'Unexpected private input size');
+    await pipeline(Readable.fromWeb(payload.body), createWriteStream(destination, { flags: 'wx' }));
+    assert.equal(statSync(destination).size, length);
+    return;
+  }
   const yaml = require('js-yaml');
+  if (mode === 'candidate') {
+    const [, , directory] = process.argv;
+    assert.ok(directory);
+    const manifestPath = path.join(directory, 'latest.yml');
+    const manifest = manifestData(await readFile(manifestPath), yaml);
+    const installer = path.join(directory, manifest.path);
+    const size = statSync(installer).size;
+    assert.ok(size <= 350_000_000);
+    assert.equal(size, manifest.files[0].size);
+    assert.equal(await digest(createReadStream(installer), 'sha512', 'base64'), manifest.sha512);
+    await publish(mode, manifest, manifestPath, installer, null, yaml);
+    return;
+  }
   const release = await fetchRelease(mode);
   if (!release) {
     console.log('No formal GitHub release is available');
@@ -322,4 +353,3 @@ async function main() {
   }
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });
-
