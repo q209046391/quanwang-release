@@ -1,0 +1,11 @@
+{
+  "tag": "v8.5",
+  "candidate": "8.5.7",
+  "commit": "d71d6472056969493a2aedff05d5e8662369efbe",
+  "baseCommit": "a82112521dc8cf44060b4d3a7bf272ef3a4116b1",
+  "baseSha256": "8a763eda4962a0062ecb9063270f9b695055c6bf25305cf96f62cfc40c1c5fbb",
+  "overlaySha256": "5ac17579fa8bd9aa632bb02fe93ccaada84cbaf60e81bb26bd7273642c1d64c9",
+  "source": {"id": 797087500, "size": 6147230, "sha256": "1e27492d8ea02c4e09f4c82ac509704a415ca57e271f955939a53c687287b4f4"},
+  "portable": {"id": 797087471, "size": 146927699, "sha256": "81b17a9154ad4b6fa94200a5a30cf5e6b861261c180fc19b293026f327e7a669"},
+  "electron": {"version": "44.11.5", "id": 765373993, "size": 158322092, "sha256": "2938040ee81382bb8a99954425a316fee17f23d55f5be0ef413275f7e793c8af"}
+}
