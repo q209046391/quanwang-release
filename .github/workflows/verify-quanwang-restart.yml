@@ -29,8 +29,10 @@ jobs:
           $setup = Start-Process -FilePath $installer -ArgumentList ('/S /currentuser /D=' + $installed) -PassThru -Wait -WindowStyle Hidden
           if ($setup.ExitCode -ne 0) { throw "8.4.5 installation failed ($($setup.ExitCode))" }
           $application = Join-Path $installed '全网短剧.exe'
-          if ((Get-Item -LiteralPath $application).VersionInfo.ProductVersion -notmatch '^8\.4\.5(?:\.0)?$') {
-            throw 'Expected installed version 8.4.5'
+          if (!(Test-Path -LiteralPath $application -PathType Leaf)) { throw 'The client executable was not installed' }
+          $archive = Join-Path $installed 'resources/app.asar'
+          if ((Get-FileHash -LiteralPath $archive).Hash -ne '0D3457A1E44026653072A08A0AB6C3CE9128690DAB32A7F0A1063CF64A2DF5CF') {
+            throw 'The installed 8.4.5 test payload differs'
           }
           "QUANWANG_APP=$application" >> $env:GITHUB_ENV
       - name: Request the update and observe the automatic restart
