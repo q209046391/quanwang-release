@@ -1,4 +1,4 @@
-name: Verify Quanwang installer restart from GitHub and COS
+name: Verify Quanwang installer restart from published updates
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        channel: [github, cos]
+        channel: [github, cos, cos-automation]
     env:
       UPDATE_CHANNEL: ${{ matrix.channel }}
     steps:
@@ -42,7 +42,7 @@ jobs:
           }
           "QUANWANG_APP=$application" >> $env:GITHUB_ENV
       - name: Prepare the identical 8.4.5 COS test payload
-        if: matrix.channel == 'cos'
+        if: matrix.channel != 'github'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -56,7 +56,9 @@ jobs:
           const path = require('node:path');
           const asar = require('@electron/asar');
           const original = 'https://github.com/q209046391/quanwang-release/releases/download/quanwang-app-test-8.4.6/';
-          const feed = 'https://quanwang-update-test-1542797533.cos.ap-guangzhou.myqcloud.com/';
+          const automation = process.env.UPDATE_CHANNEL === 'cos-automation';
+          const feed = 'https://quanwang-update-test-1542797533.cos.ap-guangzhou.myqcloud.com/'
+            + (automation ? 'automation-test/' : '');
           const resources = path.join(path.dirname(process.env.QUANWANG_APP), 'resources');
           const archive = path.join(resources, 'app.asar');
           const payload = path.join(__dirname, 'payload');
@@ -71,7 +73,8 @@ jobs:
             replace(path.join(payload, 'main.js'), original, feed);
             replace(path.join(payload, 'main.js'), '请检查 GitHub 连接后重试', '请检查网络连接后重试');
             replace(path.join(resources, 'app-update.yml'), original, feed);
-            replace(path.join(resources, 'app-update.yml'), 'quanwang-github-app-validation', 'quanwang-cos-app-validation');
+            const cacheName = automation ? 'quanwang-cos-upload-validation' : 'quanwang-cos-app-validation';
+            replace(path.join(resources, 'app-update.yml'), 'quanwang-github-app-validation', cacheName);
             await asar.createPackageWithOptions(payload, patched, { unpackDir: path.join('build', 'sdk-playback') });
             fs.copyFileSync(patched, archive);
           }
@@ -79,7 +82,12 @@ jobs:
           '@ | Set-Content -LiteralPath (Join-Path $fixture 'prepare.cjs') -Encoding utf8NoBOM
           node (Join-Path $fixture 'prepare.cjs')
           $archive = Join-Path (Split-Path -Parent $env:QUANWANG_APP) 'resources/app.asar'
-          if ((Get-FileHash -LiteralPath $archive).Hash -ne '85EFF2EE2C4AE87E6B60E970E54BA6DA10C4733002C0162A7E30A04F6C47334B') {
+          $expected = if ($env:UPDATE_CHANNEL -eq 'cos-automation') {
+            'C1F952E05DE213A06135B78FD625E96BAED7B66DF52B6396D46249E6DA84B757'
+          } else {
+            '85EFF2EE2C4AE87E6B60E970E54BA6DA10C4733002C0162A7E30A04F6C47334B'
+          }
+          if ((Get-FileHash -LiteralPath $archive).Hash -ne $expected) {
             throw 'The constructed COS payload does not match the local 8.4.5 COS test installer'
           }
       - name: Request the update and observe the automatic restart
