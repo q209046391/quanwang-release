@@ -1,4 +1,4 @@
-name: Verify full Quanwang installer restart
+name: Verify Quanwang installer restart from GitHub and COS
 
 on:
   workflow_dispatch:
@@ -13,6 +13,12 @@ jobs:
   verify:
     runs-on: windows-latest
     timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [github, cos]
+    env:
+      UPDATE_CHANNEL: ${{ matrix.channel }}
     steps:
       - name: Install the verified 8.4.5 test client
         shell: pwsh
@@ -35,6 +41,47 @@ jobs:
             throw 'The installed 8.4.5 test payload differs'
           }
           "QUANWANG_APP=$application" >> $env:GITHUB_ENV
+      - name: Prepare the identical 8.4.5 COS test payload
+        if: matrix.channel == 'cos'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $fixture = Join-Path $env:RUNNER_TEMP 'quanwang-cos-preparation'
+          New-Item -ItemType Directory -Path $fixture | Out-Null
+          npm install --prefix $fixture --no-audit --no-fund @electron/asar@3.4.1
+          @'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const asar = require('@electron/asar');
+          const original = 'https://github.com/q209046391/quanwang-release/releases/download/quanwang-app-test-8.4.6/';
+          const feed = 'https://quanwang-update-test-1542797533.cos.ap-guangzhou.myqcloud.com/';
+          const resources = path.join(path.dirname(process.env.QUANWANG_APP), 'resources');
+          const archive = path.join(resources, 'app.asar');
+          const payload = path.join(__dirname, 'payload');
+          const patched = path.join(__dirname, 'app.asar');
+          function replace(file, before, after) {
+            const text = fs.readFileSync(file, 'utf8');
+            assert.equal(text.split(before).length, 2, 'Unexpected source in ' + file);
+            fs.writeFileSync(file, text.replace(before, after));
+          }
+          async function main() {
+            asar.extractAll(archive, payload);
+            replace(path.join(payload, 'main.js'), original, feed);
+            replace(path.join(payload, 'main.js'), '请检查 GitHub 连接后重试', '请检查网络连接后重试');
+            replace(path.join(resources, 'app-update.yml'), original, feed);
+            replace(path.join(resources, 'app-update.yml'), 'quanwang-github-app-validation', 'quanwang-cos-app-validation');
+            await asar.createPackageWithOptions(payload, patched, { unpackDir: path.join('build', 'sdk-playback') });
+            fs.copyFileSync(patched, archive);
+          }
+          main().catch(error => { console.error(error.message); process.exitCode = 1; });
+          '@ | Set-Content -LiteralPath (Join-Path $fixture 'prepare.cjs') -Encoding utf8NoBOM
+          node (Join-Path $fixture 'prepare.cjs')
+          $archive = Join-Path (Split-Path -Parent $env:QUANWANG_APP) 'resources/app.asar'
+          if ((Get-FileHash -LiteralPath $archive).Hash -ne '85EFF2EE2C4AE87E6B60E970E54BA6DA10C4733002C0162A7E30A04F6C47334B') {
+            throw 'The constructed COS payload does not match the local 8.4.5 COS test installer'
+          }
       - name: Request the update and observe the automatic restart
         shell: pwsh
         run: |
@@ -96,12 +143,13 @@ jobs:
               socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, awaitPromise: true, returnByValue: true } }));
             });
             assert.equal(result, true);
-            console.log('Requested the GitHub update from the 8.4.5 Settings page');
+            console.log('Requested the ' + process.env.UPDATE_CHANNEL + ' update from the 8.4.5 Settings page');
           } finally {
             clearTimeout(deadline);
             socket.close();
           }
           '@ | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'trigger-quanwang-update.mjs') -Encoding utf8NoBOM
+          $elapsed = [Diagnostics.Stopwatch]::StartNew()
           node (Join-Path $env:RUNNER_TEMP 'trigger-quanwang-update.mjs')
           $archive = Join-Path (Split-Path -Parent $env:QUANWANG_APP) 'resources/app.asar'
           $limit = [DateTime]::UtcNow.AddMinutes(5)
@@ -117,7 +165,7 @@ jobs:
               if ((Get-FileHash -LiteralPath $archive).Hash -ne '98085E9D68C3CC57B09BE98F388162EACDB3E09A5B3C1C1F1BA5D23E5B644C09') {
                 throw 'The installed 8.4.6 payload differs'
               }
-              'PASS: the GitHub installer replaced 8.4.5 and automatically launched the verified 8.4.6 client'
+              "PASS: the $env:UPDATE_CHANNEL installer replaced 8.4.5 and automatically launched the verified 8.4.6 client in $([Math]::Round($elapsed.Elapsed.TotalSeconds,1)) seconds"
               exit 0
             }
             Start-Sleep -Seconds 2
