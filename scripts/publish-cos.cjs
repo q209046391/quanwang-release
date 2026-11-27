@@ -120,6 +120,7 @@ async function getTemporaryCredentials(token) {
   }
   const { TmpSecretId: SecretId, TmpSecretKey: SecretKey, Token: SecurityToken } = result.Credentials;
   assert.ok(SecretId && SecretKey && SecurityToken);
+  console.log('Tencent STS issued a temporary publishing credential');
   return { SecretId, SecretKey, SecurityToken };
 }
 
@@ -134,7 +135,7 @@ async function currentManifest(prefix, yaml, objectExists) {
 async function publish(mode, manifest, manifestPath, installerPath, yaml) {
   const prefix = mode === 'stable' ? 'windows/x64/' : 'automation-test/';
   const COS = require('cos-nodejs-sdk-v5');
-  const cos = new COS(await getTemporaryCredentials(await getIdentityToken()));
+  const cos = new COS({ ...await getTemporaryCredentials(await getIdentityToken()), Timeout: 120_000 });
   const call = (method, name, options = {}) => new Promise((resolve, reject) => cos[method]({
     Bucket: bucket, Region: region, Key: prefix + name, ...options,
   }, (err, value) => err ? reject(err) : resolve(value)));
@@ -176,12 +177,15 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
   const assetUrl = origin + prefix + manifest.path;
   // Never replace an existing versioned EXE with different bytes.
   if (!await objectExists(manifest.path)) {
+    console.log('Uploading the checked installer to ' + prefix);
     await upload(manifest.path, installerPath, 'application/octet-stream', 'public, max-age=31536000, immutable');
   }
+  console.log('Downloading the COS installer to verify the published bytes');
   const asset = await request(assetUrl);
   assert.ok(asset.ok && asset.body, 'The installer is not publicly downloadable, HTTP ' + asset.status);
   assert.equal(Number(asset.headers.get('content-length')), manifest.files[0].size);
   assert.equal(await digest(Readable.fromWeb(asset.body), 'sha512', 'base64'), manifest.sha512);
+  console.log('Publishing latest.yml after installer verification');
   await upload('latest.yml', manifestPath, 'application/yaml', 'no-store, max-age=0');
   const published = await currentManifest(prefix, yaml);
   assert.equal(published?.version, manifest.version);
