@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { createReadStream, createWriteStream, statSync } = require('node:fs');
 const { mkdtemp, readFile, rm } = require('node:fs/promises');
@@ -137,15 +138,17 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
   const prefix = mode === 'stable' ? 'windows/x64/' : 'automation-test/';
   const COS = require('cos-nodejs-sdk-v5');
   const { SecretId, SecretKey, SecurityToken } = await getTemporaryCredentials(await getIdentityToken());
-  async function signedRequest(method, name, options = {}) {
+  function signedHeaders(method, name, headers = {}) {
     const Key = prefix + name;
     const url = new URL(Key, origin);
-    const Headers = { host: url.host, 'x-cos-security-token': SecurityToken, ...options.headers };
+    const Headers = { host: url.host, 'x-cos-security-token': SecurityToken, ...headers };
     const authorization = COS.getAuthorization({ SecretId, SecretKey, Method: method, Key, Headers, Expires: 300 });
-    return request(url, { ...options, method, redirect: 'error', headers: { ...Headers, authorization } });
+    return { ...Headers, authorization };
   }
   async function objectExists(name) {
-    const result = await signedRequest('HEAD', name, { signal: AbortSignal.timeout(30_000) });
+    const result = await request(origin + prefix + name, {
+      method: 'HEAD', redirect: 'error', headers: signedHeaders('HEAD', name), signal: AbortSignal.timeout(30_000),
+    });
     if (result.status === 404) return false;
     assert.ok(result.ok, 'COS could not check ' + name + ': HTTP ' + result.status);
     return true;
@@ -165,20 +168,25 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
   }
 
   async function upload(name, source, type, cache) {
-    const result = await signedRequest('PUT', name, {
-      body: createReadStream(source),
-      duplex: 'half',
-      headers: {
-        'x-cos-acl': 'public-read',
-        'content-length': String(statSync(source).size),
-        'content-md5': await digest(createReadStream(source), 'md5', 'base64'),
-        'content-type': type,
-        'cache-control': cache,
-      },
+    const headers = signedHeaders('PUT', name, {
+      'x-cos-acl': 'public-read',
+      'content-length': String(statSync(source).size),
+      'content-md5': await digest(createReadStream(source), 'md5', 'base64'),
+      'content-type': type,
+      'cache-control': cache,
     });
-    const body = await result.text();
-    const code = body.match(/<Code>([\w.]+)<\/Code>/)?.[1];
-    assert.ok(result.ok, 'COS upload failed for ' + name + ': HTTP ' + result.status + (code ? ' ' + code : ''));
+    const input = Object.entries(headers).map(([key, value]) => 'header = ' + JSON.stringify(key + ': ' + value)).join('\n');
+    const log = 'HTTP %{http_code}, sent %{size_upload} bytes in %{time_total}s';
+    const result = spawnSync('curl', [
+      '--config', '-', '--silent', '--http1.1', '--connect-timeout', '15', '--max-time', '120',
+      '--expect100-timeout', '5', '--header', 'Expect: 100-continue',
+      '--upload-file', source, '--output', path.join(path.dirname(source), 'cos-response.xml'),
+      '--write-out', log, origin + prefix + name,
+    ], { input, encoding: 'utf8', timeout: 125_000, maxBuffer: 16_384 });
+    const summary = result.stdout || 'no HTTP response';
+    assert.ok(result.status === 0 && /^HTTP 2\d\d\b/.test(summary),
+      'COS upload failed for ' + name + ': ' + summary + ' (curl ' + (result.status ?? result.error?.code) + ')');
+    console.log(name + ': ' + summary);
   }
 
   const assetUrl = origin + prefix + manifest.path;
