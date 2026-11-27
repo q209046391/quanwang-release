@@ -112,7 +112,7 @@ async function getTemporaryCredentials(token) {
       ProviderId: 'quanwang-github',
       RoleArn: role,
       RoleSessionName: 'quanwang-' + process.env.GITHUB_RUN_ID,
-      DurationSeconds: 900,
+      DurationSeconds: 2400,
       WebIdentityToken: token,
     }),
   });
@@ -181,7 +181,8 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
     const log = 'HTTP %{http_code}, sent %{size_upload} bytes in %{time_total}s';
     const { status, summary } = await new Promise((resolve, reject) => {
       const child = spawn('curl', [
-        '--config', '-', '--silent', '--http1.1', '--connect-timeout', '15', '--max-time', '115',
+        '--config', '-', '--silent', '--http1.1', '--connect-timeout', '15', '--max-time', '140',
+        '--retry', '1', '--retry-max-time', '285',
         '--expect100-timeout', '5', '--header', 'Expect: 100-continue',
         '--upload-file', source, '--output', responsePath, '--dump-header', headerPath,
         '--write-out', log, url.href,
@@ -223,13 +224,16 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
     assert.ok(uploadId, 'COS did not return a multipart upload ID');
     const source = await open(installerPath, 'r');
     try {
-      const partSize = 2 * 1024 * 1024;
+      const partSize = 1024 * 1024;
       const total = statSync(installerPath).size;
       const count = Math.ceil(total / partSize);
-      const parts = [];
-      for (let offset = 0; offset < count; offset += 16) {
-        const batch = Array.from({ length: Math.min(16, count - offset) }, (_, i) => offset + i);
-        const finished = await Promise.allSettled(batch.map(async index => {
+      const parts = Array(count);
+      let next = 0;
+      let received = 0;
+      let failure;
+      async function worker() {
+        while (!failure && next < count) {
+          const index = next++;
           const start = index * partSize;
           const part = Buffer.alloc(Math.min(partSize, total - start));
           const { bytesRead } = await source.read(part, 0, part.length, start);
@@ -240,13 +244,14 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
           const headers = await uploadFile(name, partPath, {}, { partNumber: String(number), uploadId });
           const etag = headers.match(/^etag:\s*"?([a-f\d]+)"?\s*$/im)?.[1];
           assert.match(etag ?? '', /^[a-f\d]{32}$/i);
-          return '<Part><PartNumber>' + number + '</PartNumber><ETag>"' + etag + '"</ETag></Part>';
-        }));
-        const failure = finished.find(item => item.status === 'rejected');
-        if (failure) throw failure.reason;
-        parts.push(...finished.map(item => item.value));
-        console.log('COS received ' + parts.length + ' of ' + count + ' parts');
+          parts[index] = '<Part><PartNumber>' + number + '</PartNumber><ETag>"' + etag + '"</ETag></Part>';
+          received++;
+          if (received % 16 === 0 || received === count) console.log('COS received ' + received + ' of ' + count + ' parts');
+        }
       }
+      await Promise.all(Array.from({ length: Math.min(24, count) }, () =>
+        worker().catch(error => { failure ||= error; })));
+      if (failure) throw failure;
       const body = '<CompleteMultipartUpload>' + parts.join('') + '</CompleteMultipartUpload>';
       await multipartControl('POST', name, { uploadId }, { 'content-type': 'application/xml' }, body);
     } catch (error) {
