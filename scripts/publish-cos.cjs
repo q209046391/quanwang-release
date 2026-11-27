@@ -1,8 +1,8 @@
 const assert = require('node:assert/strict');
-const { spawnSync } = require('node:child_process');
+const { spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { createReadStream, createWriteStream, statSync } = require('node:fs');
-const { mkdtemp, readFile, rm } = require('node:fs/promises');
+const { mkdtemp, open, readFile, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const { Readable } = require('node:stream');
@@ -138,11 +138,11 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
   const prefix = mode === 'stable' ? 'windows/x64/' : 'automation-test/';
   const COS = require('cos-nodejs-sdk-v5');
   const { SecretId, SecretKey, SecurityToken } = await getTemporaryCredentials(await getIdentityToken());
-  function signedHeaders(method, name, headers = {}) {
+  function signedHeaders(method, name, headers = {}, Query = {}) {
     const Key = prefix + name;
     const url = new URL(Key, origin);
     const Headers = { host: url.host, 'x-cos-security-token': SecurityToken, ...headers };
-    const authorization = COS.getAuthorization({ SecretId, SecretKey, Method: method, Key, Headers, Expires: 300 });
+    const authorization = COS.getAuthorization({ SecretId, SecretKey, Method: method, Key, Headers, Query, Expires: 300 });
     return { ...Headers, authorization };
   }
   async function objectExists(name) {
@@ -167,33 +167,101 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
     }
   }
 
-  async function upload(name, source, type, cache) {
+  async function uploadFile(name, source, extraHeaders, query = {}) {
+    const responsePath = source + '.cos-body';
+    const headerPath = source + '.cos-head';
+    const url = new URL(prefix + name, origin);
+    for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
     const headers = signedHeaders('PUT', name, {
-      'x-cos-acl': 'public-read',
       'content-length': String(statSync(source).size),
       'content-md5': await digest(createReadStream(source), 'md5', 'base64'),
-      'content-type': type,
-      'cache-control': cache,
-    });
+      ...extraHeaders,
+    }, query);
     const input = Object.entries(headers).map(([key, value]) => 'header = ' + JSON.stringify(key + ': ' + value)).join('\n');
     const log = 'HTTP %{http_code}, sent %{size_upload} bytes in %{time_total}s';
-    const result = spawnSync('curl', [
-      '--config', '-', '--silent', '--http1.1', '--connect-timeout', '15', '--max-time', '120',
-      '--expect100-timeout', '5', '--header', 'Expect: 100-continue',
-      '--upload-file', source, '--output', path.join(path.dirname(source), 'cos-response.xml'),
-      '--write-out', log, origin + prefix + name,
-    ], { input, encoding: 'utf8', timeout: 125_000, maxBuffer: 16_384 });
-    const summary = result.stdout || 'no HTTP response';
-    assert.ok(result.status === 0 && /^HTTP 2\d\d\b/.test(summary),
-      'COS upload failed for ' + name + ': ' + summary + ' (curl ' + (result.status ?? result.error?.code) + ')');
-    console.log(name + ': ' + summary);
+    const { status, summary } = await new Promise((resolve, reject) => {
+      const child = spawn('curl', [
+        '--config', '-', '--silent', '--http1.1', '--connect-timeout', '15', '--max-time', '115',
+        '--expect100-timeout', '5', '--header', 'Expect: 100-continue',
+        '--upload-file', source, '--output', responsePath, '--dump-header', headerPath,
+        '--write-out', log, url.href,
+      ], { stdio: ['pipe', 'pipe', 'ignore'] });
+      let stdout = '';
+      child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
+      child.stdin.on('error', reject);
+      child.on('error', reject);
+      child.on('close', status => resolve({ status, summary: stdout || 'no HTTP response' }));
+      child.stdin.end(input);
+    });
+    const body = await readFile(responsePath, 'utf8').catch(() => '');
+    const code = body.match(/<Code>([\w.]+)<\/Code>/)?.[1];
+    assert.ok(status === 0 && /^HTTP 2\d\d\b/.test(summary),
+      'COS upload failed for ' + name + ': ' + summary + ' (curl ' + status + (code ? ', ' + code : '') + ')');
+    return readFile(headerPath, 'utf8');
+  }
+
+  async function multipartControl(method, name, query, headers = {}, body) {
+    const url = new URL(prefix + name, origin);
+    for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
+    const result = await request(url, {
+      method, body, headers: signedHeaders(method, name, headers, query),
+      redirect: 'error', signal: AbortSignal.timeout(45_000),
+    });
+    const xml = await result.text();
+    const code = xml.match(/<Code>([\w.]+)<\/Code>/)?.[1];
+    assert.ok(result.ok && !code, 'COS multipart ' + method + ': HTTP ' + result.status + (code ? ' ' + code : ''));
+    return xml;
+  }
+
+  async function uploadInstaller(name) {
+    const xml = await multipartControl('POST', name, { uploads: '' }, {
+      'x-cos-acl': 'public-read',
+      'content-type': 'application/octet-stream',
+      'cache-control': 'public, max-age=31536000, immutable',
+    });
+    const uploadId = xml.match(/<UploadId>([A-Za-z0-9._~+/=-]+)<\/UploadId>/)?.[1];
+    assert.ok(uploadId, 'COS did not return a multipart upload ID');
+    const source = await open(installerPath, 'r');
+    try {
+      const partSize = 2 * 1024 * 1024;
+      const total = statSync(installerPath).size;
+      const count = Math.ceil(total / partSize);
+      const parts = [];
+      for (let offset = 0; offset < count; offset += 16) {
+        const batch = Array.from({ length: Math.min(16, count - offset) }, (_, i) => offset + i);
+        const finished = await Promise.allSettled(batch.map(async index => {
+          const start = index * partSize;
+          const part = Buffer.alloc(Math.min(partSize, total - start));
+          const { bytesRead } = await source.read(part, 0, part.length, start);
+          assert.equal(bytesRead, part.length);
+          const number = index + 1;
+          const partPath = path.join(path.dirname(installerPath), 'part-' + number);
+          await writeFile(partPath, part, { flag: 'wx' });
+          const headers = await uploadFile(name, partPath, {}, { partNumber: String(number), uploadId });
+          const etag = headers.match(/^etag:\s*"?([a-f\d]+)"?\s*$/im)?.[1];
+          assert.match(etag ?? '', /^[a-f\d]{32}$/i);
+          return '<Part><PartNumber>' + number + '</PartNumber><ETag>"' + etag + '"</ETag></Part>';
+        }));
+        const failure = finished.find(item => item.status === 'rejected');
+        if (failure) throw failure.reason;
+        parts.push(...finished.map(item => item.value));
+        console.log('COS received ' + parts.length + ' of ' + count + ' parts');
+      }
+      const body = '<CompleteMultipartUpload>' + parts.join('') + '</CompleteMultipartUpload>';
+      await multipartControl('POST', name, { uploadId }, { 'content-type': 'application/xml' }, body);
+    } catch (error) {
+      await multipartControl('DELETE', name, { uploadId }).catch(cleanup => console.warn(cleanup.message));
+      throw error;
+    } finally {
+      await source.close();
+    }
   }
 
   const assetUrl = origin + prefix + manifest.path;
   // Never replace an existing versioned EXE with different bytes.
   if (!await objectExists(manifest.path)) {
     console.log('Uploading the checked installer to ' + prefix);
-    await upload(manifest.path, installerPath, 'application/octet-stream', 'public, max-age=31536000, immutable');
+    await uploadInstaller(manifest.path);
   }
   console.log('Downloading the COS installer to verify the published bytes');
   const asset = await request(assetUrl);
@@ -201,7 +269,9 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
   assert.equal(Number(asset.headers.get('content-length')), manifest.files[0].size);
   assert.equal(await digest(Readable.fromWeb(asset.body), 'sha512', 'base64'), manifest.sha512);
   console.log('Publishing latest.yml after installer verification');
-  await upload('latest.yml', manifestPath, 'application/yaml', 'no-store, max-age=0');
+  await uploadFile('latest.yml', manifestPath, {
+    'x-cos-acl': 'public-read', 'content-type': 'application/yaml', 'cache-control': 'no-store, max-age=0',
+  });
   const published = await currentManifest(prefix, yaml);
   assert.equal(published?.version, manifest.version);
   assert.equal(published?.sha512, manifest.sha512);
