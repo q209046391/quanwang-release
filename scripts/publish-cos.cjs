@@ -60,6 +60,12 @@ async function downloadAsset(file, dest) {
   assert.equal('sha256:' + await digest(createReadStream(dest), 'sha256', 'hex'), file.digest);
 }
 
+async function downloadInstaller(asset, dest, manifest) {
+  await downloadAsset(asset, dest);
+  assert.equal(await digest(createReadStream(dest), 'sha512', 'base64'), manifest.sha512);
+  console.log('Verified GitHub release assets for ' + manifest.version);
+}
+
 function manifestData(buffer, yaml) {
   assert.ok(buffer.byteLength <= 16_384);
   const manifest = yaml.load(buffer.toString('utf8'));
@@ -134,7 +140,7 @@ async function currentManifest(prefix, yaml, objectExists) {
   return manifestData(Buffer.from(await result.arrayBuffer()), yaml);
 }
 
-async function publish(mode, manifest, manifestPath, installerPath, yaml) {
+async function publish(mode, manifest, manifestPath, installerPath, exeAsset, yaml) {
   const prefix = mode === 'stable' ? 'windows/x64/' : 'automation-test/';
   const COS = require('cos-nodejs-sdk-v5');
   const { SecretId, SecretKey, SecurityToken } = await getTemporaryCredentials(await getIdentityToken());
@@ -265,6 +271,7 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
   const assetUrl = origin + prefix + manifest.path;
   // Never replace an existing versioned EXE with different bytes.
   if (!await objectExists(manifest.path)) {
+    await downloadInstaller(exeAsset, installerPath, manifest);
     console.log('Uploading the checked installer to ' + prefix);
     await uploadInstaller(manifest.path);
   }
@@ -304,11 +311,12 @@ async function main() {
     const manifest = manifestData(await readFile(manifestPath), yaml);
     assert.equal(manifest.version, version);
     assert.equal(manifest.files[0].size, exeAsset.size);
-    await downloadAsset(exeAsset, installerPath);
-    assert.equal(await digest(createReadStream(installerPath), 'sha512', 'base64'), manifest.sha512);
-    console.log('Verified GitHub release assets for ' + version);
-    if (mode === 'validate') await getIdentityToken();
-    else await publish(mode, manifest, manifestPath, installerPath, yaml);
+    if (mode === 'validate') {
+      await downloadInstaller(exeAsset, installerPath, manifest);
+      await getIdentityToken();
+    } else {
+      await publish(mode, manifest, manifestPath, installerPath, exeAsset, yaml);
+    }
   } finally {
     await rm(folder, { recursive: true, force: true });
   }
