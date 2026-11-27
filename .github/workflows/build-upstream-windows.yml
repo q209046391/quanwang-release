@@ -1,0 +1,129 @@
+name: Build upstream Windows candidate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '21 2 * * *'
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-upstream-windows.yml
+      - scripts/windows-build-inputs.json
+
+permissions: {}
+
+concurrency:
+  group: quanwang-upstream-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.repository == 'q209046391/quanwang-release' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Check whether the latest upstream tag is approved and new
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+          INPUTS_ENABLED: ${{ vars.QUANWANG_BUILD_INPUTS_ENABLED }}
+        run: |
+          set -euo pipefail
+          release="$(gh api repos/jackotom/hongguo-drama/releases/latest)"
+          pinned="$(jq -er .tag scripts/windows-build-inputs.json)"
+          tag="$(jq -er .tag_name <<<"$release")"
+          if [[ "$tag" != "$pinned" ]]; then
+            echo "::notice::Upstream $tag needs compatibility review before a candidate is built."
+            exit 0
+          fi
+          if [[ "$INPUTS_ENABLED" != "true" ]]; then
+            echo "::notice::The private branded build input is not enabled."
+            exit 0
+          fi
+          if [[ "$FORCE_RUN" != "true" ]]; then
+            feed='https://quanwang-update-test-1542797533.cos.ap-guangzhou.myqcloud.com/automation-test/candidate/'
+            if curl --fail --silent --show-error --max-time 30 --output latest.yml "${feed}latest.yml" &&
+               grep -Eq '^version: [0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$' latest.yml &&
+               [[ "$(awk '/^version:/{print $2}' latest.yml)" == "$(jq -er .candidate scripts/windows-build-inputs.json)" ]]; then
+              echo "::notice::The approved version is already on the candidate feed."
+              exit 0
+            fi
+          fi
+          echo 'build=true' >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Download the pinned private branding input
+        env:
+          COS_PUBLISH_MODE: build-input
+          COS_ROLE_ARN: ${{ vars.COS_ROLE_ARN }}
+        run: |
+          npm ci --prefix scripts --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/publish-cos.cjs "$env:RUNNER_TEMP/quanwang-overlay.zip"
+      - name: Merge and build isolated Windows candidate
+        id: package
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+          ACTIONS_ID_TOKEN_REQUEST_URL: ''
+        run: |
+          Remove-Item Env:ACTIONS_ID_TOKEN_REQUEST_TOKEN,Env:ACTIONS_ID_TOKEN_REQUEST_URL -ErrorAction SilentlyContinue
+          ./scripts/auto-package-windows.ps1 -Overlay "$env:RUNNER_TEMP/quanwang-overlay.zip" -Work "$env:RUNNER_TEMP/quanwang-build"
+      - name: Stage only the redistributable update files
+        env:
+          WINDOWS_OUTPUT: ${{ steps.package.outputs.windows }}
+        run: |
+          $pin = Get-Content -Raw scripts/windows-build-inputs.json | ConvertFrom-Json
+          $upload = New-Item -Path "$env:RUNNER_TEMP/quanwang-candidate" -ItemType Directory
+          Copy-Item -LiteralPath (Join-Path $env:WINDOWS_OUTPUT 'latest.yml') -Destination $upload
+          Copy-Item -LiteralPath (Join-Path $env:WINDOWS_OUTPUT "quanwang-$($pin.candidate)-setup.exe") -Destination $upload
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: quanwang-update-candidate
+          path: ${{ runner.temp }}/quanwang-candidate/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: quanwang-cos-publisher
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: quanwang-update-candidate
+          path: ${{ runner.temp }}/quanwang-candidate
+      - name: Verify and publish only to the candidate feed
+        env:
+          COS_PUBLISH_MODE: candidate
+          COS_ROLE_ARN: ${{ vars.COS_ROLE_ARN }}
+        run: |
+          npm ci --prefix scripts --ignore-scripts --no-audit --no-fund
+          node scripts/publish-cos.cjs "$RUNNER_TEMP/quanwang-candidate"
