@@ -98,6 +98,7 @@ async function getTemporaryCredentials(token) {
   assert.match(role ?? '', /^qcs::cam::uin\/\d+:roleName\/quanwang-cos-publisher$/);
   const response = await request('https://sts.tencentcloudapi.com', {
     method: 'POST',
+    signal: AbortSignal.timeout(45_000),
     headers: {
       Authorization: 'SKIP',
       'Content-Type': 'application/json; charset=utf-8',
@@ -135,18 +136,19 @@ async function currentManifest(prefix, yaml, objectExists) {
 async function publish(mode, manifest, manifestPath, installerPath, yaml) {
   const prefix = mode === 'stable' ? 'windows/x64/' : 'automation-test/';
   const COS = require('cos-nodejs-sdk-v5');
-  const cos = new COS({ ...await getTemporaryCredentials(await getIdentityToken()), Timeout: 120_000 });
-  const call = (method, name, options = {}) => new Promise((resolve, reject) => cos[method]({
-    Bucket: bucket, Region: region, Key: prefix + name, ...options,
-  }, (err, value) => err ? reject(err) : resolve(value)));
+  const { SecretId, SecretKey, SecurityToken } = await getTemporaryCredentials(await getIdentityToken());
+  async function signedRequest(method, name, options = {}) {
+    const Key = prefix + name;
+    const url = new URL(Key, origin);
+    const Headers = { host: url.host, 'x-cos-security-token': SecurityToken, ...options.headers };
+    const authorization = COS.getAuthorization({ SecretId, SecretKey, Method: method, Key, Headers, Expires: 300 });
+    return request(url, { ...options, method, redirect: 'error', headers: { ...Headers, authorization } });
+  }
   async function objectExists(name) {
-    try {
-      await call('headObject', name);
-      return true;
-    } catch (error) {
-      if (Number(error.statusCode) === 404) return false;
-      throw Error('COS could not check ' + name + ': ' + (error.code || error.statusCode || 'unknown'));
-    }
+    const result = await signedRequest('HEAD', name, { signal: AbortSignal.timeout(30_000) });
+    if (result.status === 404) return false;
+    assert.ok(result.ok, 'COS could not check ' + name + ': HTTP ' + result.status);
+    return true;
   }
   const current = await currentManifest(prefix, yaml, objectExists);
   if (current) {
@@ -163,15 +165,20 @@ async function publish(mode, manifest, manifestPath, installerPath, yaml) {
   }
 
   async function upload(name, source, type, cache) {
-    const ContentMD5 = await digest(createReadStream(source), 'md5', 'base64');
-    try {
-      await call('putObject', name, {
-        ACL: 'public-read', Body: createReadStream(source), ContentLength: statSync(source).size,
-        ContentMD5, ContentType: type, CacheControl: cache,
-      });
-    } catch (error) {
-      throw Error('COS upload failed for ' + name + ': ' + (error.code || error.statusCode || 'unknown'));
-    }
+    const result = await signedRequest('PUT', name, {
+      body: createReadStream(source),
+      duplex: 'half',
+      headers: {
+        'x-cos-acl': 'public-read',
+        'content-length': String(statSync(source).size),
+        'content-md5': await digest(createReadStream(source), 'md5', 'base64'),
+        'content-type': type,
+        'cache-control': cache,
+      },
+    });
+    const body = await result.text();
+    const code = body.match(/<Code>([\w.]+)<\/Code>/)?.[1];
+    assert.ok(result.ok, 'COS upload failed for ' + name + ': HTTP ' + result.status + (code ? ' ' + code : ''));
   }
 
   const assetUrl = origin + prefix + manifest.path;
