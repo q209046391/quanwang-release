@@ -1,0 +1,180 @@
+name: Verify the COS Windows candidate upgrade
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Build upstream Windows candidate]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'q209046391/quanwang-release' && github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      UPDATE_CHANNEL: cos-candidate
+      EXPECTED_VERSION: '8.5.7'
+    steps:
+      - name: Install the verified 8.4.5 test client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $installer = Join-Path $env:RUNNER_TEMP 'quanwang-8.4.5-restart-test.exe'
+          $installed = Join-Path $env:RUNNER_TEMP 'quanwang-app'
+          $asset = 'https://github.com/q209046391/quanwang-release/releases/download/quanwang-app-test-8.4.6/quanwang-8.4.5-restart-test.exe'
+          curl.exe --fail --location --silent --show-error --retry 3 --max-time 180 $asset --output $installer
+          if ((Get-FileHash -LiteralPath $installer).Hash -ne 'A5838EEFBA66C91DB8276D580E0FE8A3C4336728462B6E4E8E714A327557693C') {
+            throw 'The 8.4.5 test installer checksum differs'
+          }
+          $setup = Start-Process -FilePath $installer -ArgumentList ('/S /currentuser /D=' + $installed) -PassThru -Wait -WindowStyle Hidden
+          if ($setup.ExitCode -ne 0) { throw "8.4.5 installation failed ($($setup.ExitCode))" }
+          $application = Join-Path $installed '全网短剧.exe'
+          if (!(Test-Path -LiteralPath $application -PathType Leaf)) { throw 'The client executable was not installed' }
+          $archive = Join-Path $installed 'resources/app.asar'
+          if ((Get-FileHash -LiteralPath $archive).Hash -ne '0D3457A1E44026653072A08A0AB6C3CE9128690DAB32A7F0A1063CF64A2DF5CF') {
+            throw 'The installed 8.4.5 test payload differs'
+          }
+          "QUANWANG_APP=$application" >> $env:GITHUB_ENV
+      - name: Prepare the identical 8.4.5 COS test payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $fixture = Join-Path $env:RUNNER_TEMP 'quanwang-cos-preparation'
+          New-Item -ItemType Directory -Path $fixture | Out-Null
+          npm install --prefix $fixture --ignore-scripts --no-audit --no-fund @electron/asar@3.4.1
+          @'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const asar = require('@electron/asar');
+          const original = 'https://github.com/q209046391/quanwang-release/releases/download/quanwang-app-test-8.4.6/';
+          const feed = 'https://quanwang-update-test-1542797533.cos.ap-guangzhou.myqcloud.com/automation-test/candidate/';
+          const target = process.env.EXPECTED_VERSION;
+          const resources = path.join(path.dirname(process.env.QUANWANG_APP), 'resources');
+          const archive = path.join(resources, 'app.asar');
+          const payload = path.join(__dirname, 'payload');
+          const patched = path.join(__dirname, 'app.asar');
+          function replace(file, before, after) {
+            const text = fs.readFileSync(file, 'utf8');
+            assert.equal(text.split(before).length, 2, 'Unexpected source in ' + file);
+            fs.writeFileSync(file, text.replace(before, after));
+          }
+          async function main() {
+            const response = await fetch(feed + 'latest.yml', { signal: AbortSignal.timeout(15000) });
+            assert.ok(response.ok, 'COS candidate manifest HTTP ' + response.status);
+            const manifest = await response.text();
+            assert.equal(manifest.match(/^version: ([\d.]+)\r?$/m)?.[1], target);
+            assert.equal(manifest.match(/^path: (quanwang-[\d.]+-setup\.exe)\r?$/m)?.[1], `quanwang-${target}-setup.exe`);
+            const hash = manifest.match(/^sha512: ([A-Za-z0-9+/]{86}==)\r?$/m)?.[1];
+            assert.ok(hash, 'Missing published installer checksum');
+            asar.extractAll(archive, payload);
+            replace(path.join(payload, 'main.js'), original, feed);
+            replace(path.join(payload, 'main.js'), '请检查 GitHub 连接后重试', '请检查网络连接后重试');
+            replace(path.join(resources, 'app-update.yml'), original, feed);
+            replace(path.join(resources, 'app-update.yml'), 'quanwang-github-app-validation', 'quanwang-cos-candidate-validation');
+            const main = path.join(payload, 'main.js');
+            replace(main, "info.version === '8.4.6'", `info.version === '${target}'`);
+            replace(main, "'quanwang-8.4.6-setup.exe'", `'quanwang-${target}-setup.exe'`);
+            const oldHash = fs.readFileSync(main, 'utf8').match(/info\.files\[0\]\.sha512 === '([A-Za-z0-9+/]{86}==)'/)?.[1];
+            assert.ok(oldHash);
+            replace(main, oldHash, hash);
+            await asar.createPackageWithOptions(payload, patched, { unpackDir: path.join('build', 'sdk-playback') });
+            fs.copyFileSync(patched, archive);
+          }
+          main().catch(error => { console.error(error.message); process.exitCode = 1; });
+          '@ | Set-Content -LiteralPath (Join-Path $fixture 'prepare.cjs') -Encoding utf8NoBOM
+          node (Join-Path $fixture 'prepare.cjs')
+      - name: Request the update and observe the automatic restart
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $original = Start-Process -FilePath $env:QUANWANG_APP -ArgumentList '--remote-debugging-address=127.0.0.1','--remote-debugging-port=18785','--quanwang-test-update' -PassThru -WindowStyle Hidden
+          @'
+          import assert from 'node:assert/strict';
+          import { setTimeout as delay } from 'node:timers/promises';
+
+          let target;
+          for (let attempt = 0; attempt < 60 && !target; attempt++) {
+            try {
+              const response = await fetch('http://127.0.0.1:18785/json/list', { signal: AbortSignal.timeout(1000) });
+              target = (await response.json()).find(page => page.type === 'page' && page.url.includes('dist-react'));
+            } catch {}
+            if (!target) await delay(500);
+          }
+          assert.ok(target, 'The installed client did not load its renderer');
+          const socket = new WebSocket(target.webSocketDebuggerUrl);
+          const deadline = setTimeout(() => {
+            console.error('The installed renderer did not respond');
+            process.exit(1);
+          }, 20000);
+          try {
+            await new Promise((resolve, reject) => {
+              socket.addEventListener('open', resolve, { once: true });
+              socket.addEventListener('error', reject, { once: true });
+            });
+            const expression = `(async () => {
+              const button = (...labels) => [...document.querySelectorAll('button')]
+                .find(item => labels.includes(item.textContent.trim()) && !item.disabled);
+              const waitFor = async (...labels) => {
+                for (let i = 0; i < 60; i++) {
+                  const item = button(...labels);
+                  if (item) return item;
+                  await new Promise(resolve => setTimeout(resolve, 100));
+                }
+                throw new Error('Missing button: ' + labels.join(' / '));
+              };
+              const settings = await waitFor('设置', 'Settings');
+              const info = await window.electronAPI.getAppInfo();
+              if (info.version !== '8.4.5') throw new Error('The running client is not 8.4.5');
+              settings.click();
+              (await waitFor('检查更新', 'Check for updates')).click();
+              return true;
+            })()`;
+            const result = await new Promise((resolve, reject) => {
+              socket.addEventListener('message', event => {
+                const message = JSON.parse(event.data);
+                if (message.id !== 1) return;
+                if (message.error || message.result?.exceptionDetails) {
+                  reject(new Error(message.result?.exceptionDetails?.exception?.description || 'Renderer evaluation failed'));
+                } else {
+                  resolve(message.result.result.value);
+                }
+              });
+              socket.addEventListener('close', () => reject(new Error('Renderer disconnected')), { once: true });
+              socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, awaitPromise: true, returnByValue: true } }));
+            });
+            assert.equal(result, true);
+            console.log('Requested the ' + process.env.UPDATE_CHANNEL + ' update from the 8.4.5 Settings page');
+          } finally {
+            clearTimeout(deadline);
+            socket.close();
+          }
+          '@ | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'trigger-quanwang-update.mjs') -Encoding utf8NoBOM
+          $elapsed = [Diagnostics.Stopwatch]::StartNew()
+          node (Join-Path $env:RUNNER_TEMP 'trigger-quanwang-update.mjs')
+          $archive = Join-Path (Split-Path -Parent $env:QUANWANG_APP) 'resources/app.asar'
+          $limit = [DateTime]::UtcNow.AddMinutes(5)
+          do {
+            $name = [IO.Path]::GetFileName($env:QUANWANG_APP)
+            $restarted = Get-CimInstance Win32_Process -Filter "Name='$name'" | Where-Object {
+              $_.ProcessId -ne $original.Id -and $_.ExecutablePath -eq $env:QUANWANG_APP -and
+                $_.CommandLine -match '(?:^|\s)--updated(?:\s|$)'
+            } | Select-Object -First 1
+            if ($restarted -and $original.HasExited) {
+              $version = (Get-Item -LiteralPath $env:QUANWANG_APP).VersionInfo.ProductVersion
+              if ($version -ne $env:EXPECTED_VERSION -and $version -ne ($env:EXPECTED_VERSION + '.0')) {
+                throw "Unexpected version after restart: $version"
+              }
+              "PASS: COS updated 8.4.5 to $version and restarted in $([Math]::Round($elapsed.Elapsed.TotalSeconds,1)) seconds"
+              exit 0
+            }
+            Start-Sleep -Seconds 2
+          } while ([DateTime]::UtcNow -lt $limit)
+          throw "No automatic restart within five minutes (original exited: $($original.HasExited))"
